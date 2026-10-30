@@ -63,5 +63,5 @@ jobs:
           else
             gh release create "$tag" release/* --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
               --title "httpfs $tag" \
-              --notes "httpfs for DuckDB ${DUCKDB_VERSION}, built from ${GITHUB_SHA}. Unsigned: DuckDB must be opened with allow_unsigned_extensions."
+              --notes "httpfs for DuckDB ${DUCKDB_VERSION}, built from ${GITHUB_SHA}. Unsigned: DuckDB must be opened with allow_unsigned_extensions. DuckDB names an extension after its file, so rename the asset to httpfs.duckdb_extension before loading or installing it."
           fi
