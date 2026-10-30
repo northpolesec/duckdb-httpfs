@@ -242,10 +242,7 @@ unique_ptr<HTTPResponse> HTTPFileSystem::GetRequest(FileHandle &handle, string u
 			    }
 			    throw HTTPException(error);
 		    }
-		    if (hfh.http_params.s3_version_id_pinning && hfh.version_id.empty() &&
-		        response.HasHeader("x-amz-version-id")) {
-			    hfh.version_id = response.GetHeaderValue("x-amz-version-id");
-		    }
+		    hfh.PinVersion(response);
 		    return true;
 	    },
 	    [&](const_data_ptr_t data, idx_t data_length) {
@@ -302,18 +299,7 @@ unique_ptr<HTTPResponse> HTTPFileSystem::GetRangeRequest(FileHandle &handle, str
 
 			    if (!hfh.http_params.unsafe_disable_etag_checks && !hfh.etag.empty() && response.HasHeader("ETag")) {
 				    string responseEtag = response.GetHeaderValue("ETag");
-
-				    // Strip surrounding quotes for comparison: some S3-compatible backends
-				    // (e.g. NetApp ONTAP) omit quotes in ListObjectsV2 XML ETags, while
-				    // HTTP headers include them per RFC 7232
-				    auto strip_quotes = [](const string &etag) -> string {
-					    if (etag.size() >= 2 && etag.front() == '"' && etag.back() == '"') {
-						    return etag.substr(1, etag.size() - 2);
-					    }
-					    return etag;
-				    };
-
-				    if (!responseEtag.empty() && strip_quotes(responseEtag) != strip_quotes(hfh.etag)) {
+				    if (!responseEtag.empty() && !ETagsMatch(responseEtag, hfh.etag)) {
 					    if (global_metadata_cache) {
 						    global_metadata_cache->Erase(handle.path);
 					    }
@@ -330,10 +316,7 @@ unique_ptr<HTTPResponse> HTTPFileSystem::GetRangeRequest(FileHandle &handle, str
 				    }
 			    }
 
-			    if (hfh.http_params.s3_version_id_pinning && hfh.version_id.empty() &&
-			        response.HasHeader("x-amz-version-id")) {
-				    hfh.version_id = response.GetHeaderValue("x-amz-version-id");
-			    }
+			    hfh.PinVersion(response);
 
 			    if (response.HasHeader("Content-Length")) {
 				    unsigned long long content_length;
@@ -380,6 +363,35 @@ HTTPInput::HTTPInput(unique_ptr<HTTPParams> params_p)
     : params(std::move(params_p)), http_params(params->Cast<HTTPFSParams>()) {
 }
 
+bool HTTPFileSystem::ETagsMatch(const string &left, const string &right) {
+	// Some S3-compatible backends (e.g. NetApp ONTAP) omit quotes in ListObjectsV2 XML ETags, while HTTP headers
+	// include them per RFC 7232
+	auto strip_quotes = [](const string &etag) -> string {
+		if (etag.size() >= 2 && etag.front() == '"' && etag.back() == '"') {
+			return etag.substr(1, etag.size() - 2);
+		}
+		return etag;
+	};
+	return strip_quotes(left) == strip_quotes(right);
+}
+
+void HTTPFileHandle::PinVersion(const HTTPResponse &response) {
+	if (!http_params.s3_version_id_pinning || !response.HasHeader("x-amz-version-id")) {
+		return;
+	}
+	lock_guard<mutex> guard(mu);
+	if (!version_id.empty()) {
+		return;
+	}
+	version_id = response.GetHeaderValue("x-amz-version-id");
+	// A matching ETag shows this is the listed version. Suspended-versioning buckets report "null", which an
+	// overwrite replaces in place, so it is not shared.
+	if (opened_from_listing && http_params.state && version_id != "null" && response.HasHeader("ETag") &&
+	    HTTPFileSystem::ETagsMatch(response.GetHeaderValue("ETag"), etag)) {
+		http_params.state->SetListedVersion(path, etag, version_id);
+	}
+}
+
 HTTPFileHandle::HTTPFileHandle(FileSystem &fs, const OpenFileInfo &file, FileOpenFlags flags,
                                shared_ptr<HTTPInput> input_p)
     : FileHandle(fs, file.path, flags), http_input(std::move(input_p)), http_params(http_input->http_params),
@@ -409,6 +421,7 @@ HTTPFileHandle::HTTPFileHandle(FileSystem &fs, const OpenFileInfo &file, FileOpe
 			// we found all relevant entries (last_modified, etag and file size)
 			// skip head request
 			initialized = true;
+			opened_from_listing = true;
 		}
 	}
 }
@@ -936,6 +949,10 @@ void HTTPFileHandle::Initialize(optional_ptr<FileOpener> opener) {
 	http_params.state = HTTPState::TryGetState(opener);
 	if (!http_params.state) {
 		http_params.state = make_shared_ptr<HTTPState>();
+	}
+	// Another handle in this query may already have read this listed file; read the same version
+	if (opened_from_listing && http_params.s3_version_id_pinning && version_id.empty()) {
+		version_id = http_params.state->GetListedVersion(path, etag);
 	}
 
 	if (opener) {

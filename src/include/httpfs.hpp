@@ -87,6 +87,8 @@ public:
 	string version_id;
 	bool force_full_download;
 	bool initialized = false;
+	//! Opened from a listing's ETag, size and last-modified, so no response has yet named its version
+	bool opened_from_listing = false;
 
 	bool auto_fallback_to_full_file_download = true;
 
@@ -121,6 +123,10 @@ public:
 	unique_ptr<HTTPClient> GetClient();
 	// Return the client for re-use
 	void StoreClient(unique_ptr<HTTPClient> client);
+
+	//! With s3_version_id_pinning, pins the handle to the version a successful read returned. A listed file shares
+	//! it with the query's other handles once the response's ETag shows it is the listed version.
+	void PinVersion(const HTTPResponse &response);
 
 	// Whether to bypass the read buffer
 	bool SkipBuffer() const {
@@ -162,6 +168,8 @@ public:
 class HTTPFileSystem : public FileSystem {
 public:
 	static bool TryParseLastModifiedTime(const string &timestamp, timestamp_t &result);
+	//! Compares ETags ignoring surrounding quotes, which some S3-compatible listings omit
+	static bool ETagsMatch(const string &left, const string &right);
 
 	vector<OpenFileInfo> Glob(const string &path, FileOpener *opener = nullptr) override {
 		if (path.find('*') != std::string::npos && opener) {

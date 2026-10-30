@@ -74,6 +74,10 @@ public:
 	void Reset();
 	//! Get cache entry, create if not exists
 	shared_ptr<CachedFile> &GetCachedFile(const string &path);
+	//! The S3 version a listed file's ETag was read at in this query, or empty
+	string GetListedVersion(const string &path, const string &etag);
+	//! Records the S3 version a listed file's ETag was read at, so every handle in the query reads it
+	void SetListedVersion(const string &path, const string &etag, const string &version_id);
 	//! Helper functions to get the HTTP state
 	static shared_ptr<HTTPState> TryGetState(ClientContext &context);
 	static shared_ptr<HTTPState> TryGetState(optional_ptr<FileOpener> opener);
@@ -102,6 +106,9 @@ private:
 	mutex cached_files_mutex;
 	//! In case of fully downloading the file, the cached files of this query
 	unordered_map<string, shared_ptr<CachedFile>> cached_files;
+	mutex listed_versions_mutex;
+	//! Listed file path to its listed ETag and the S3 version that ETag was read at
+	unordered_map<string, pair<string, string>> listed_versions;
 };
 
 } // namespace duckdb

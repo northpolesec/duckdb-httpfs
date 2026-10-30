@@ -625,31 +625,103 @@ unique_ptr<HTTPResponse> S3FileSystem::GetRequest(FileHandle &handle, string s3_
 	return HTTPFileSystem::GetRequest(handle, http_url, headers);
 }
 
+// Whether a listed file's read failed because the object was replaced after the listing: the ETag check rejected
+// the response (a 2xx), or the new object no longer fits the listed size (416) or If-Match (412)
+static bool ListedObjectReplaced(const S3FileHandle &handle, const string &s3_url, const ErrorData &error) {
+	if (!handle.opened_from_listing || !handle.http_params.s3_version_id_pinning ||
+	    handle.http_params.unsafe_disable_etag_checks || IsGCSRequest(s3_url) || error.Type() != ExceptionType::HTTP) {
+		return false;
+	}
+	auto &extra_info = error.ExtraInfo();
+	auto status = extra_info.find("status_code");
+	if (status == extra_info.end()) {
+		return false;
+	}
+	return status->second == "200" || status->second == "206" || status->second == "412" || status->second == "416";
+}
+
 unique_ptr<HTTPResponse> S3FileSystem::GetRangeRequest(FileHandle &handle, string s3_url, HTTPHeaders header_map,
                                                        idx_t file_offset, char *buffer_out, idx_t buffer_out_len) {
 	auto &s3_handle = handle.Cast<S3FileHandle>();
 	auto auth_params = s3_handle.auth_params;
 	auto parsed_s3_url = S3UrlParse(s3_url, auth_params);
 
-	string query_string;
-	if (!s3_handle.version_id.empty()) {
-		query_string = "versionId=" + UrlEncode(s3_handle.version_id, true);
+	auto get_range = [&](const string &version_id) {
+		string query_string;
+		if (!version_id.empty()) {
+			query_string = "versionId=" + UrlEncode(version_id, true);
+		}
+
+		string http_url = parsed_s3_url.GetHTTPUrl(auth_params, query_string);
+
+		HTTPHeaders headers;
+		if (IsGCSRequest(s3_url) && !auth_params.oauth2_bearer_token.empty()) {
+			// Use bearer token for GCS
+			headers["Authorization"] = "Bearer " + auth_params.oauth2_bearer_token;
+			headers["Host"] = parsed_s3_url.host;
+		} else {
+			// Use existing S3 authentication
+			headers = CreateS3Header(parsed_s3_url.path, query_string, parsed_s3_url.host, "s3", "GET", auth_params, "",
+			                         "", "", "");
+		}
+
+		return HTTPFileSystem::GetRangeRequest(handle, http_url, headers, file_offset, buffer_out, buffer_out_len);
+	};
+
+	auto &state = s3_handle.http_params.state;
+	string version_id;
+	{
+		lock_guard<mutex> guard(s3_handle.mu);
+		// Another handle may have learned this listed file's version since this one was opened
+		if (s3_handle.version_id.empty() && s3_handle.opened_from_listing &&
+		    s3_handle.http_params.s3_version_id_pinning && state) {
+			s3_handle.version_id = state->GetListedVersion(s3_handle.path, s3_handle.etag);
+		}
+		version_id = s3_handle.version_id;
+	}
+	// A failed read either throws or, as a try request, returns the error
+	unique_ptr<HTTPResponse> response;
+	std::exception_ptr failure;
+	ErrorData error;
+	try {
+		response = get_range(version_id);
+		if (!response->HasRequestError()) {
+			return response;
+		}
+		error = ErrorData(response->GetRequestError());
+	} catch (std::exception &ex) {
+		failure = std::current_exception();
+		error = ErrorData(ex);
+	}
+	auto fail = [&]() {
+		if (failure) {
+			std::rethrow_exception(failure);
+		}
+		return std::move(response);
+	};
+	if (!version_id.empty() || !ListedObjectReplaced(s3_handle, s3_url, error)) {
+		return fail();
 	}
 
-	string http_url = parsed_s3_url.GetHTTPUrl(auth_params, query_string);
-
-	HTTPHeaders headers;
-	if (IsGCSRequest(s3_url) && !auth_params.oauth2_bearer_token.empty()) {
-		// Use bearer token for GCS
-		headers["Authorization"] = "Bearer " + auth_params.oauth2_bearer_token;
-		headers["Host"] = parsed_s3_url.host;
-	} else {
-		// Use existing S3 authentication
-		headers = CreateS3Header(parsed_s3_url.path, query_string, parsed_s3_url.host, "s3", "GET", auth_params, "", "",
-		                         "", "");
+	// The object was replaced before this handle learned its version: read the listed version instead, as another
+	// handle in the query learned it or as the bucket's version history still holds it
+	auto listed_version = state ? state->GetListedVersion(s3_handle.path, s3_handle.etag) : string();
+	if (listed_version.empty()) {
+		listed_version = AWSListObjectVersions::FindVersion(s3_url, s3_handle.http_params, auth_params, s3_handle.etag);
 	}
-
-	return HTTPFileSystem::GetRangeRequest(handle, http_url, headers, file_offset, buffer_out, buffer_out_len);
+	if (listed_version.empty()) {
+		return fail();
+	}
+	{
+		lock_guard<mutex> guard(s3_handle.mu);
+		if (s3_handle.version_id.empty()) {
+			s3_handle.version_id = listed_version;
+		}
+	}
+	if (state) {
+		state->SetListedVersion(s3_handle.path, s3_handle.etag, listed_version);
+	}
+	return get_range(listed_version);
 }
 
 unique_ptr<HTTPResponse> S3FileSystem::DeleteRequest(FileHandle &handle, string s3_url, HTTPHeaders header_map) {
@@ -1555,6 +1627,94 @@ vector<string> AWSListObjectV2::ParseCommonPrefix(string &aws_response) {
 		}
 	}
 	return s3_prefixes;
+}
+
+string AWSListObjectVersions::FindVersion(const string &path, HTTPParams &http_params, S3AuthParams &s3_auth_params,
+                                          const string &etag) {
+	// Versions of other keys under the same prefix come after this key's, so few pages are ever needed
+	const idx_t MAX_PAGES = 100;
+	auto parsed_url = S3FileSystem::S3UrlParse(path, s3_auth_params);
+	string req_path = parsed_url.path.substr(0, parsed_url.path.length() - parsed_url.key.length());
+	string key_marker;
+	string version_id_marker;
+	for (idx_t page = 0; page < MAX_PAGES; page++) {
+		// NOTE: req_params needs to be sorted before passing to sigv4 code
+		map<string, string> req_params;
+		req_params["encoding-type"] = "url";
+		if (!key_marker.empty()) {
+			req_params["key-marker"] = S3FileSystem::UrlEncode(key_marker, true);
+		}
+		req_params["prefix"] = S3FileSystem::UrlEncode(parsed_url.key, true);
+		if (!version_id_marker.empty()) {
+			req_params["version-id-marker"] = S3FileSystem::UrlEncode(version_id_marker, true);
+		}
+		req_params["versions"] = "";
+		string encoded_params;
+		for (const auto &p : req_params) {
+			encoded_params += (encoded_params.empty() ? "" : "&") + p.first + "=" + p.second;
+		}
+		auto header_map =
+		    CreateS3Header(req_path, encoded_params, parsed_url.host, "s3", "GET", s3_auth_params, "", "", "", "");
+		string url = parsed_url.http_proto + parsed_url.host + req_path + "?" + encoded_params;
+
+		std::stringstream body;
+		bool failed = false;
+		GetRequestInfo get_request(
+		    url, header_map, http_params,
+		    [&](const HTTPResponse &response) {
+			    failed = static_cast<int>(response.status) >= 400;
+			    return true;
+		    },
+		    [&](const_data_ptr_t data, idx_t data_length) {
+			    body << string(const_char_ptr_cast(data), data_length);
+			    return true;
+		    });
+		get_request.try_request = true;
+		auto result = http_params.http_util.Request(get_request);
+		if (failed || !result || result->HasRequestError()) {
+			// e.g. no s3:ListBucketVersions permission: the original read error stands
+			return string();
+		}
+
+		auto response = body.str();
+		idx_t pos = 0;
+		while (true) {
+			auto start = response.find("<Version>", pos);
+			if (start == string::npos) {
+				break;
+			}
+			auto end = response.find("</Version>", start);
+			if (end == string::npos) {
+				break;
+			}
+			auto version = response.substr(start, end - start);
+			pos = end;
+			string key, version_id, version_etag;
+			FindTagContents(version, "Key", 0, key);
+			if (S3FileSystem::UrlDecode(key) != parsed_url.key) {
+				return string();
+			}
+			FindTagContents(version, "VersionId", 0, version_id);
+			FindTagContents(version, "ETag", 0, version_etag);
+			version_etag = StringUtil::Replace(version_etag, "&quot;", "\"");
+			version_etag = StringUtil::Replace(version_etag, "&#34;", "\"");
+			if (version_id != "null" && HTTPFileSystem::ETagsMatch(version_etag, etag)) {
+				return version_id;
+			}
+		}
+		if (response.find("<IsTruncated>true</IsTruncated>") == string::npos) {
+			return string();
+		}
+		key_marker.clear();
+		version_id_marker.clear();
+		FindTagContents(response, "NextKeyMarker", 0, key_marker);
+		FindTagContents(response, "NextVersionIdMarker", 0, version_id_marker);
+		key_marker = S3FileSystem::UrlDecode(key_marker);
+		if (key_marker != parsed_url.key || version_id_marker.empty()) {
+			return string();
+		}
+	}
+	return string();
 }
 
 S3KeyValueReader::S3KeyValueReader(FileOpener &opener_p, optional_ptr<FileOpenerInfo> info, const char **secret_types,
