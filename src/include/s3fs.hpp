@@ -237,6 +237,12 @@ struct AWSListObjectV2 {
 	static string ParseContinuationToken(string &aws_response);
 };
 
+struct AWSListObjectVersions {
+	//! The ID of the object's version with this ETag, or empty if its version history has none or cannot be read
+	static string FindVersion(const string &path, HTTPParams &http_params, S3AuthParams &s3_auth_params,
+	                          const string &etag);
+};
+
 HTTPHeaders CreateS3Header(string url, string query, string host, string service, string method,
                            const S3AuthParams &auth_params, string date_now = "", string datetime_now = "",
                            string payload_hash = "", string content_type = "", string content_md5 = "");

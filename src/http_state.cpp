@@ -58,6 +58,9 @@ void HTTPState::Reset() {
 
 	// Reset cached files
 	cached_files.clear();
+
+	lock_guard<mutex> lock(listed_versions_mutex);
+	listed_versions.clear();
 }
 
 shared_ptr<HTTPState> HTTPState::TryGetState(ClientContext &context) {
@@ -105,6 +108,20 @@ shared_ptr<CachedFile> &HTTPState::GetCachedFile(const string &path) {
 		cache_entry_ref = make_shared_ptr<CachedFile>();
 	}
 	return cache_entry_ref;
+}
+
+string HTTPState::GetListedVersion(const string &path, const string &etag) {
+	lock_guard<mutex> lock(listed_versions_mutex);
+	auto entry = listed_versions.find(path);
+	if (entry == listed_versions.end() || entry->second.first != etag) {
+		return string();
+	}
+	return entry->second.second;
+}
+
+void HTTPState::SetListedVersion(const string &path, const string &etag, const string &version_id) {
+	lock_guard<mutex> lock(listed_versions_mutex);
+	listed_versions[path] = make_pair(etag, version_id);
 }
 
 } // namespace duckdb
