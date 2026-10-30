@@ -8,7 +8,7 @@ else
   rm -rf /tmp/minio_root_data
   mkdir -p /tmp/minio_test_data
   mkdir -p /tmp/minio_root_data
-  docker compose -f scripts/minio_s3.yml -p duckdb-minio up -d
+  docker compose -f scripts/seaweedfs_s3.yml -p duckdb-minio up -d
 
   # for testing presigned url
   container_name=$(docker ps -a --format '{{.Names}}' | grep -m 1 "duckdb-minio")
@@ -22,6 +22,13 @@ else
     fi
     sleep 1
   done
+  if [ -z "${docker_finish_logs}" ]; then
+    echo "S3 test server setup did not finish; container logs follow"
+    for name in $(docker ps -a --format '{{.Names}}' | grep "duckdb-minio"); do
+      echo "=== $name"
+      docker logs "$name" 2>&1 | tail -n 40
+    done
+  fi
 
 
   export S3_SMALL_CSV_PRESIGNED_URL=$(docker logs $container_name 2>/dev/null | grep -m 1 'Share:.*phonenumbers\.csv' | grep -o 'http[s]\?://[^ ]\+')
