@@ -8,7 +8,7 @@ else
   rm -rf /tmp/minio_root_data
   mkdir -p /tmp/minio_test_data
   mkdir -p /tmp/minio_root_data
-  docker compose -f scripts/minio_s3.yml -p duckdb-minio up -d
+  docker compose -f scripts/seaweedfs_s3.yml -p duckdb-minio up -d
 
   # for testing presigned url
   container_name=$(docker ps -a --format '{{.Names}}' | grep -m 1 "duckdb-minio")
